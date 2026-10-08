@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import time
 
 import streamlit as st
 from google import genai
@@ -20,6 +21,18 @@ from pypdf import PdfReader
 DEFAULT_MODEL = "gemini-3.8-flash"  # Google retired gemini-2.5-flash for new users
 # Override without editing code: set GEMINI_MODEL in Streamlit secrets or as an env var.
 MODEL_NAME = os.environ.get("GEMINI_MODEL", DEFAULT_MODEL)
+APP_VERSION = "v4 - retry + 5 fallback models"  # shown in sidebar to confirm the deploy updated
+# Tried in order if the main model is overloaded (503) or unavailable (404).
+# Override with GEMINI_FALLBACK_MODELS="model-a,model-b" in secrets / env.
+FALLBACK_MODELS = [
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",  # lighter models often have spare capacity
+    "gemini-3.1-flash-lite",
+]
+ATTEMPTS_PER_MODEL = 2       # tries per model before moving to the next one
+RETRY_BASE_DELAY = 2         # seconds; doubles each retry (2s, 4s)
 MAX_RESUME_CHARS = 30_000
 MAX_JD_CHARS = 10_000
 MIN_RESUME_CHARS = 150
@@ -224,18 +237,54 @@ def normalize_result(data: dict) -> dict:
     }
 
 
-def analyze_resume(api_key: str, resume_text: str, job_description: str, model: str = "") -> dict:
-    client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=model or MODEL_NAME,
-        contents=build_prompt(resume_text[:MAX_RESUME_CHARS], job_description[:MAX_JD_CHARS]),
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
-            temperature=0.2,
-            response_mime_type="application/json",
-        ),
+def _is_transient(exc: Exception) -> bool:
+    """Temporary errors worth retrying: overload, rate limit, server errors, bad JSON."""
+    if isinstance(exc, (json.JSONDecodeError, ValueError)):
+        return True
+    code = getattr(exc, "code", None)
+    msg = str(exc).lower()
+    return code in (429, 500, 502, 503, 504) or any(
+        t in msg for t in ("503", "unavailable", "high demand", "overloaded", "429",
+                           "resource_exhausted", "500", "504", "deadline", "timeout")
     )
-    return normalize_result(parse_json_response(response.text))
+
+
+def _is_model_gone(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return getattr(exc, "code", None) == 404 or "404" in msg or "not_found" in msg or "no longer available" in msg
+
+
+def analyze_resume(api_key: str, resume_text: str, job_description: str, model: str = "",
+                   fallbacks: list[str] | None = None) -> dict:
+    """Call Gemini with retries + model fallback. Adds 'model_used' to the result."""
+    client = genai.Client(api_key=api_key)
+    prompt = build_prompt(resume_text[:MAX_RESUME_CHARS], job_description[:MAX_JD_CHARS])
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_INSTRUCTION,
+        temperature=0.2,
+        response_mime_type="application/json",
+    )
+    primary = model or MODEL_NAME
+    candidates = [primary] + [m for m in (FALLBACK_MODELS if fallbacks is None else fallbacks) if m != primary]
+
+    last_exc: Exception | None = None
+    for name in candidates:
+        for attempt in range(ATTEMPTS_PER_MODEL):
+            try:
+                response = client.models.generate_content(model=name, contents=prompt, config=config)
+                result = normalize_result(parse_json_response(response.text))
+                result["model_used"] = name
+                return result
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if _is_model_gone(exc):
+                    break  # this model is unavailable to us -> next model
+                if not _is_transient(exc):
+                    raise  # e.g. invalid API key: retrying won't help
+                if attempt < ATTEMPTS_PER_MODEL - 1:
+                    time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+        # attempts exhausted for this model -> fall through to the next one
+    raise last_exc if last_exc else RuntimeError("No Gemini model could be reached.")
 
 
 # --------------------------------------------------------------------------- #
@@ -248,6 +297,16 @@ def get_model_name() -> str:
     except Exception:
         name = ""
     return name or MODEL_NAME
+
+
+def get_fallback_models() -> list[str]:
+    try:
+        raw = st.secrets.get("GEMINI_FALLBACK_MODELS", "")
+    except Exception:
+        raw = ""
+    raw = raw or os.environ.get("GEMINI_FALLBACK_MODELS", "")
+    models = [m.strip() for m in raw.split(",") if m.strip()]
+    return models or FALLBACK_MODELS
 
 
 def get_api_key() -> str:
@@ -278,6 +337,9 @@ def friendly_error(exc: Exception) -> str:
         return ("The Gemini model is unavailable. Set GEMINI_MODEL in your Streamlit secrets "
                 "to a current model (see https://ai.google.dev/gemini-api/docs/models). "
                 f"Details: {msg[:200]}")
+    if "503" in msg or "unavailable" in low or "high demand" in low:
+        return ("Gemini is overloaded right now (all models tried). This is temporary on "
+                "Google's side - please wait a minute and click Analyze again.")
     if "429" in msg or "quota" in low or "rate" in low or "resource_exhausted" in low:
         return "Gemini rate limit / quota reached. Wait a minute and try again."
     if isinstance(exc, (json.JSONDecodeError, ValueError)):
@@ -293,6 +355,8 @@ def render_results(result: dict, text: str) -> None:
         st.progress(result["overall"] / 100)
         st.markdown(f"**{score_label(result['overall'])}**")
         st.caption(f"Detected target role: {result['target_role']}")
+        if result.get("model_used"):
+            st.caption(f"Analyzed with `{result['model_used']}`")
     with right:
         st.markdown("#### Score breakdown")
         for key, label in CATEGORY_LABELS.items():
@@ -373,6 +437,7 @@ def main() -> None:
             ).strip()
         model_name = get_model_name()
         st.caption(f"Model: `{model_name}`")
+        st.caption(f"App version: {APP_VERSION}")
         st.caption("Your resume is sent to Google's Gemini API for analysis and is not stored by this app.")
 
     col1, col2 = st.columns(2)
@@ -406,7 +471,7 @@ def main() -> None:
 
         try:
             with st.spinner("Analyzing with Gemini..."):
-                result = analyze_resume(api_key, text, job_description.strip(), model_name)
+                result = analyze_resume(api_key, text, job_description.strip(), model_name, get_fallback_models())
             st.session_state["result"] = result
             st.session_state["text"] = text
         except Exception as exc:
